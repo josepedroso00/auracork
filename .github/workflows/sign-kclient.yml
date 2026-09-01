@@ -1,0 +1,70 @@
+name: Sign KClient IPA
+on:
+  push:
+    branches: [main, master]
+
+jobs:
+  sign:
+    name: Re-sign KClient IPA
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode signing materials
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.KCLIENT_P12_BASE64 }}" | base64 --decode > certificate.p12
+          echo "${{ secrets.KCLIENT_PROFILE_BASE64 }}" | base64 --decode > profile.mobileprovision
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+
+      - name: Create keychain and import certificate
+        run: |
+          set -euo pipefail
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security import certificate.p12 -k build.keychain \
+            -P "${{ secrets.KCLIENT_P12_PASSWORD }}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+
+      - name: Re-sign IPA
+        run: |
+          set -euo pipefail
+          echo "=== Keychain identities ==="
+          security find-identity -v -p codesigning build.keychain || true
+          echo "========================="
+          mkdir -p work && cd work
+          unzip -q ../kclient.ipa
+          APP_PATH=$(find . -name "*.app" -maxdepth 2 | head -1)
+          if [ -z "$APP_PATH" ]; then echo "No .app found in IPA"; exit 1; fi
+          HASH=$(security find-identity -v -p codesigning build.keychain | head -1 | awk '{print $2}')
+          if [ -z "$HASH" ]; then echo "No codesigning identity found in keychain"; exit 1; fi
+          echo "Signing with identity: $HASH"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier auracork.com.auracork.KClientV60" "$APP_PATH/Info.plist"
+          cp ../profile.mobileprovision "$APP_PATH/embedded.mobileprovision"
+          # Derive entitlements from the provisioning profile so application-identifier matches
+          # the (rewritten) bundle id and the customer's team, instead of preserving stale ones.
+          security cms -D -i ../profile.mobileprovision > provision.plist
+          /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' provision.plist > entitlementsDev.plist
+          # Sign all frameworks and dylibs first
+          if [ -d "$APP_PATH/Frameworks" ]; then
+            find "$APP_PATH/Frameworks" -type d -name "*.framework" -o -type f -name "*.dylib" | while read f; do
+              codesign --force --sign "$HASH" "$f"
+            done
+          fi
+          # Sign the main app with the profile-derived entitlements
+          codesign --force --sign "$HASH" --entitlements entitlementsDev.plist "$APP_PATH"
+          cd ..
+          cd work && zip -qr ../signed.ipa Payload/ && cd ..
+
+      - name: Upload signed IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-kclient-ipa
+          path: signed.ipa
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: security delete-keychain build.keychain 2>/dev/null || true
